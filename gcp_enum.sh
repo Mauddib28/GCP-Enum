@@ -8,6 +8,7 @@
 #   -c: limit to current project only (no iteration over projects list in full mode).
 #   --deep-search runs config checks by default; use --no-config-check to skip.
 #   --iam-policy-summary: with --full / --deep, append per-role row counts after each project IAM table.
+#   BigQuery: bq ls -p JSON -> table + gcloud projects describe per id (python3); GCP_ENUM_BQ_* caps; best-effort bq show.
 #
 # Auth: if no active gcloud user account, runs: gcloud auth login --no-browser
 #
@@ -37,6 +38,9 @@ usage() {
   echo "  --with-json-analysis      run optional Python IAM conditional-binding pass (requires python3)"
   echo "Project IAM (--full and --deep):"
   echo "  --iam-policy-summary      after each project IAM table, append role occurrence counts (flattened member rows)"
+  echo "Environment (optional):"
+  echo "  GCP_ENUM_BQ_LS_P_MAX              max projects for bq ls -p pagination (default 1000000)"
+  echo "  GCP_ENUM_BQ_GCLOUD_DESCRIBE_MAX   max gcloud projects describe per BQ-listed id (0=unlimited; default 0)"
   echo "  If no account is active, gcloud auth login --no-browser runs automatically."
   exit 1
 }
@@ -58,6 +62,8 @@ no_config_check=0
 iam_policy_summary=0
 
 : "${GCP_ENUM_JSON_ANALYSIS:=0}"
+: "${GCP_ENUM_BQ_LS_P_MAX:=1000000}"
+: "${GCP_ENUM_BQ_GCLOUD_DESCRIBE_MAX:=0}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -112,6 +118,125 @@ _enum_project_iam_bindings() {
   section "$_iam_title — role row counts (one row per principal in each binding)"
   gcloud projects get-iam-policy "$_iam_proj" --flatten="bindings[].members" \
     --format="value(bindings.role)" 2>/dev/null | sort | uniq -c | tee -a "$LOG" || true
+}
+
+# gcloud describe is reliable; bq show <project> still uses bq's project resolution (may fail if >1000 BQ-listed projects).
+_enum_bq_default_project_summary() {
+  if [ -n "$PROJECT" ]; then
+    run gcloud projects describe "$PROJECT" $PFLAG 2>/dev/null || true
+    run bq ls --project_id="$PROJECT" 2>/dev/null || true
+    run bq show "$PROJECT" 2>/dev/null || true
+  else
+    echo "BigQuery: no project id; skipping gcloud projects describe, scoped bq ls, and bq show <id> (use -p or gcloud config set project)" | tee -a "$LOG"
+    run bq ls 2>/dev/null || true
+    echo "BigQuery: best-effort default-project bq show (may error if many BQ-listed projects)" | tee -a "$LOG"
+    run bq show 2>/dev/null || true
+  fi
+}
+
+# One bq ls -p --format=json (paginated via -n); table + per-id gcloud projects describe (RM metadata; avoids bq show resolution cap).
+_enum_bq_accessible_projects_list() {
+  _bj=$(mktemp "${TMPDIR:-/tmp}/gcp_enum_bqp.XXXXXX") || return 0
+  if ! bq ls -p -n "$GCP_ENUM_BQ_LS_P_MAX" --format=json 2>/dev/null >"$_bj"; then
+    rm -f "$_bj"
+    echo "BigQuery: bq ls -p --format=json failed; fallback bq ls -p table only" | tee -a "$LOG"
+    run bq ls -p -n "$GCP_ENUM_BQ_LS_P_MAX" 2>/dev/null || true
+    return 0
+  fi
+  [ ! -s "$_bj" ] && {
+    rm -f "$_bj"
+    echo "BigQuery: no BQ-accessible projects in list response" | tee -a "$LOG"
+    return 0
+  }
+  section "BigQuery: BQ-accessible projects (projectId, friendlyName)"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json,sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    raw = f.read().strip()
+if not raw:
+    sys.exit(0)
+r = json.loads(raw)
+if isinstance(r, dict) and isinstance(r.get("projects"), list):
+    r = r["projects"]
+if not isinstance(r, list):
+    sys.exit(0)
+print("projectId\tfriendlyName")
+for x in r:
+    if not isinstance(x, dict):
+        continue
+    pid = x.get("id") or x.get("projectId")
+    if not pid and isinstance(x.get("projectReference"), dict):
+        pid = x["projectReference"].get("projectId")
+    if not pid:
+        continue
+    fn = x.get("friendlyName") or ""
+    print("%s\t%s" % (pid, fn))
+' "$_bj" 2>/dev/null | tee -a "$LOG" || true
+  else
+    echo "BigQuery: python3 not found; dumping raw JSON (install python3 for a clear table + per-project gcloud describe)" | tee -a "$LOG"
+    tee -a "$LOG" <"$_bj" >/dev/null || true
+  fi
+  _enum_gcloud_describe_bq_json_projects "$_bj"
+  rm -f "$_bj"
+}
+
+# Args: path to bq ls -p --format=json file
+_enum_gcloud_describe_bq_json_projects() {
+  _bjf="$1"
+  [ -s "$_bjf" ] || return 0
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "BigQuery: skip gcloud projects describe for each BQ id (python3 required to parse JSON list)" | tee -a "$LOG"
+    return 0
+  fi
+  _idsf=$(mktemp "${TMPDIR:-/tmp}/gcp_enum_bqid.XXXXXX") || return 0
+  python3 -c '
+import json,sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    raw = f.read().strip()
+if not raw:
+    sys.exit(0)
+r = json.loads(raw)
+if isinstance(r, dict) and isinstance(r.get("projects"), list):
+    r = r["projects"]
+if not isinstance(r, list):
+    sys.exit(0)
+seen = set()
+for x in r:
+    if not isinstance(x, dict):
+        continue
+    pid = x.get("id") or x.get("projectId")
+    if not pid and isinstance(x.get("projectReference"), dict):
+        pid = x["projectReference"].get("projectId")
+    if pid and pid not in seen:
+        seen.add(pid)
+        print(pid)
+' "$_bjf" >"$_idsf" 2>/dev/null || {
+    rm -f "$_idsf"
+    return 0
+  }
+  [ ! -s "$_idsf" ] && {
+    rm -f "$_idsf"
+    return 0
+  }
+  section "BigQuery: gcloud projects describe (Resource Manager) per BQ-accessible project id"
+  if [ "$GCP_ENUM_BQ_GCLOUD_DESCRIBE_MAX" != "0" ]; then
+    echo "BigQuery: applying GCP_ENUM_BQ_GCLOUD_DESCRIBE_MAX=$GCP_ENUM_BQ_GCLOUD_DESCRIBE_MAX" | tee -a "$LOG"
+    _idcap=$(mktemp "${TMPDIR:-/tmp}/gcp_enum_bqidc.XXXXXX") || {
+      rm -f "$_idsf"
+      return 0
+    }
+    head -n "$GCP_ENUM_BQ_GCLOUD_DESCRIBE_MAX" "$_idsf" >"$_idcap"
+    mv "$_idcap" "$_idsf"
+  fi
+  while read -r _bqpid || [ -n "$_bqpid" ]; do
+    [ -z "$_bqpid" ] && continue
+    section "BigQuery RM metadata: $_bqpid"
+    run gcloud projects describe "$_bqpid" 2>/dev/null || true
+  done <"$_idsf"
+  rm -f "$_idsf"
 }
 
 check_gcloud() {
@@ -255,8 +380,8 @@ do_deep() {
   section "BigQuery"
   if command -v bq >/dev/null 2>&1; then
     run bq version 2>/dev/null || true
-    run bq show 2>/dev/null || true
-    run bq ls 2>/dev/null || true
+    _enum_bq_default_project_summary
+    _enum_bq_accessible_projects_list
   fi
 }
 
@@ -354,9 +479,8 @@ do_full() {
   section "BigQuery"
   if command -v bq >/dev/null 2>&1; then
     run bq version
-    run bq show
-    run bq ls
-    run bq ls -p 2>/dev/null || true
+    _enum_bq_default_project_summary
+    _enum_bq_accessible_projects_list
   fi
 }
 
