@@ -7,6 +7,7 @@
 # Usage: gcp_enum.sh [MODE] [-o OUTFILE] [-p PROJECT] [-c] [OPTIONS]
 #   -c: limit to current project only (no iteration over projects list in full mode).
 #   --deep-search runs config checks by default; use --no-config-check to skip.
+#   --iam-policy-summary: with --full / --deep, append per-role row counts after each project IAM table.
 #
 # Auth: if no active gcloud user account, runs: gcloud auth login --no-browser
 #
@@ -34,6 +35,8 @@ usage() {
   echo "Config check (--deep-search; see workDocs/CONFIG_CHECK.md):"
   echo "  --no-config-check         skip shell config heuristics after deep-search"
   echo "  --with-json-analysis      run optional Python IAM conditional-binding pass (requires python3)"
+  echo "Project IAM (--full and --deep):"
+  echo "  --iam-policy-summary      after each project IAM table, append role occurrence counts (flattened member rows)"
   echo "  If no account is active, gcloud auth login --no-browser runs automatically."
   exit 1
 }
@@ -52,6 +55,7 @@ artifact_max_packages=20
 log_search_limit=50
 log_freshness=1d
 no_config_check=0
+iam_policy_summary=0
 
 : "${GCP_ENUM_JSON_ANALYSIS:=0}"
 
@@ -79,6 +83,7 @@ while [ $# -gt 0 ]; do
     --log-freshness=*) log_freshness="${1#*=}"; shift ;;
     --log-freshness) log_freshness="$2"; shift 2 ;;
     --no-config-check) no_config_check=1; shift ;;
+    --iam-policy-summary) iam_policy_summary=1; shift ;;
     --with-json-analysis) GCP_ENUM_JSON_ANALYSIS=1; shift ;;
     -o) outfile="$2"; shift 2 ;;
     -p) project="$2"; shift 2 ;;
@@ -92,6 +97,22 @@ done
 LOG=""
 section() { echo "------ $1 ------" | tee -a "$LOG"; }
 run() { "$@" 2>&1 | tee -a "$LOG"; true; }
+
+# Args: section_title project_id
+# Table: one row per (binding,member); COND_TITLE empty when binding has no IAM condition.
+_enum_project_iam_bindings() {
+  _iam_title="$1"
+  _iam_proj="$2"
+  [ -z "$_iam_proj" ] && return 0
+  section "$_iam_title"
+  run gcloud projects get-iam-policy "$_iam_proj" --flatten="bindings[].members" \
+    --format="table(bindings.role,bindings.members,bindings.condition.title:label=COND_TITLE)" \
+    2>/dev/null || true
+  [ "$iam_policy_summary" -eq 1 ] || return 0
+  section "$_iam_title — role row counts (one row per principal in each binding)"
+  gcloud projects get-iam-policy "$_iam_proj" --flatten="bindings[].members" \
+    --format="value(bindings.role)" 2>/dev/null | sort | uniq -c | tee -a "$LOG" || true
+}
 
 check_gcloud() {
   if ! command -v gcloud >/dev/null 2>&1; then
@@ -207,8 +228,7 @@ do_deep() {
     run gcloud iam service-accounts keys list --iam-account="$sa" $PFLAG 2>/dev/null || true
   done
   if [ -n "$PROJECT" ]; then
-    section "Project IAM policy"
-    run gcloud projects get-iam-policy "$PROJECT" --flatten="bindings[].members" --format="table(bindings.role)" 2>/dev/null || true
+    _enum_project_iam_bindings "Project IAM policy" "$PROJECT"
   fi
   section "Services"
   run gcloud services list $PFLAG
@@ -257,13 +277,11 @@ do_full() {
   run gcloud projects list
   if [ $current_only -eq 0 ]; then
     for proj in $(gcloud projects list --format="value(projectId)" 2>/dev/null); do
-      section "Project IAM: $proj"
-      run gcloud projects get-iam-policy "$proj" --flatten="bindings[].members" --format="table(bindings.role)" 2>/dev/null || true
+      _enum_project_iam_bindings "Project IAM: $proj" "$proj"
     done
   else
     if [ -n "$PROJECT" ]; then
-      section "Project IAM (current)"
-      run gcloud projects get-iam-policy "$PROJECT" --flatten="bindings[].members" --format="table(bindings.role)" 2>/dev/null || true
+      _enum_project_iam_bindings "Project IAM (current)" "$PROJECT"
     fi
   fi
   section "Services"

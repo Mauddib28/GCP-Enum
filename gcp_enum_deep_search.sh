@@ -13,6 +13,18 @@ fi
 # Max object bodies to scan per bucket when --storage-content is set.
 : "${GCP_ENUM_STORAGE_CONTENT_MAX:=25}"
 
+# Bucket URL (e.g. gs://b/) + list "name" (object key) -> gs://b/key for describe/cat.
+_deep_search_object_gs_uri() {
+  _ds_bkt="$1"
+  _ds_name="$2"
+  case "$_ds_name" in
+    gs://*) printf '%s\n' "$_ds_name"; return ;;
+  esac
+  _ds_bkt="${_ds_bkt%/}"
+  _ds_name="${_ds_name#/}"
+  printf '%s/%s\n' "$_ds_bkt" "$_ds_name"
+}
+
 _deep_search_ext_ok() {
   _obj="$1"
   _base="${_obj##*/}"
@@ -60,7 +72,8 @@ deep_search_storage() {
       [ -z "$_obj" ] && continue
       _n=$((_n + 1))
       [ "$_n" -gt "$storage_max_describe" ] && break
-      run gcloud storage objects describe "$_obj" 2>/dev/null || true
+      _gs_uri=$(_deep_search_object_gs_uri "$_bkt" "$_obj")
+      run gcloud storage objects describe "$_gs_uri" 2>/dev/null || true
     done <"$_olist"
     if [ "$storage_content" -eq 1 ]; then
       _sc=0
@@ -69,9 +82,10 @@ deep_search_storage() {
         _deep_search_ext_ok "$_obj" || continue
         _sc=$((_sc + 1))
         [ "$_sc" -gt "$GCP_ENUM_STORAGE_CONTENT_MAX" ] && break
+        _gs_uri=$(_deep_search_object_gs_uri "$_bkt" "$_obj")
         section "Deep search content sample: $_obj (bytes 0-$((storage_max_bytes - 1)))"
         _range="$((storage_max_bytes - 1))"
-        _matches=$(gcloud storage cat -r "0-$_range" "$_obj" 2>/dev/null | grep -E "$GCP_ENUM_GREP_PATTERN" 2>/dev/null | head -50)
+        _matches=$(gcloud storage cat -r "0-$_range" "$_gs_uri" 2>/dev/null | grep -E "$GCP_ENUM_GREP_PATTERN" 2>/dev/null | head -50)
         if [ -n "$_matches" ]; then
           echo "$_matches" >>"$LOG"
           echo "(pattern match in sampled bytes: $_obj)" | tee -a "$LOG"
